@@ -27,6 +27,7 @@
 
 #include <functional>
 #include <optional>
+#include <vector>
 
 using namespace chip;
 using namespace chip::AddressResolve;
@@ -530,6 +531,11 @@ public:
     void Shutdown() override {}
     void SetOperationalDelegate(OperationalResolveDelegate * delegate) override {}
     CHIP_ERROR ResolveNodeId(const PeerId & peerId) override { return ResolveNodeIdStatus; }
+    CHIP_ERROR ResolveNodeId(const PeerId & peerId, bool forceRefresh) override
+    {
+        mLastForceRefresh = forceRefresh;
+        return ResolveNodeIdStatus;
+    }
     void NodeIdResolutionNoLongerNeeded(const PeerId & peerId) override {}
     CHIP_ERROR StartDiscovery(DiscoveryType type, DiscoveryFilter filter, DiscoveryContext &) override
     {
@@ -546,6 +552,7 @@ public:
     CHIP_ERROR InitStatus                  = CHIP_NO_ERROR;
     CHIP_ERROR ResolveNodeIdStatus         = CHIP_NO_ERROR;
     CHIP_ERROR DiscoverCommissionersStatus = CHIP_NO_ERROR;
+    bool mLastForceRefresh                 = false;
 };
 
 class TestAddressResolveDefaultImplWithSystemLayer : public ::testing::Test
@@ -833,6 +840,197 @@ TEST_F(TestAddressResolveDefaultImplWithSystemLayerAndNodeListener,
     EXPECT_EQ(expectedResult.address, GetAddressWithLowScore());
     EXPECT_EQ(expectedFailedPeerId.GetNodeId(), NodeId{ 3 });
     EXPECT_EQ(expectedError, CHIP_ERROR_TIMEOUT);
+}
+
+TEST_F(TestAddressResolveDefaultImplWithSystemLayerAndNodeListener, PropagatesForceRefreshToDnssdResolver)
+{
+    chip::Dnssd::Resolver::SetInstance(mockResolver);
+
+    chip::AddressResolve::Impl::Resolver resolver;
+    ASSERT_EQ(resolver.Init(&mSystemLayer), CHIP_NO_ERROR);
+
+    AddressResolve::NodeLookupHandle handle;
+    auto request = NodeLookupRequest(chip::PeerId(1, 2));
+    request.SetForceRefresh(true);
+
+    EXPECT_EQ(resolver.LookupNode(request, handle), CHIP_NO_ERROR);
+    EXPECT_TRUE(mockResolver.mLastForceRefresh);
+
+    EXPECT_EQ(resolver.CancelLookup(handle, Resolver::FailureCallback::Skip), CHIP_NO_ERROR);
+}
+
+TEST_F(TestAddressResolveDefaultImplWithSystemLayerAndNodeListener, DeliversCachedResultThenFreshResultForForcedRefresh)
+{
+    chip::Dnssd::Resolver::SetInstance(mockResolver);
+
+    chip::AddressResolve::Impl::Resolver resolver;
+    ASSERT_EQ(resolver.Init(&mSystemLayer), CHIP_NO_ERROR);
+
+    System::Clock::Internal::RAIIMockClock clock;
+    auto request = NodeLookupRequest(chip::PeerId(1, 2));
+    request.SetForceRefresh(true);
+    request.SetMinLookupTime(100_ms32);
+    request.SetMaxLookupTime(500_ms32);
+
+    AddressResolve::NodeLookupHandle handle;
+    ASSERT_EQ(resolver.LookupNode(request, handle), CHIP_NO_ERROR);
+
+    std::vector<Transport::PeerAddress> resolvedAddresses;
+    bool resolutionFailed = false;
+    mNodeListener.SetOnNodeAddressResolved(
+        [&resolvedAddresses](const PeerId &, const ResolveResult & result) { resolvedAddresses.push_back(result.address); });
+    mNodeListener.SetOnNodeAddressResolutionFailed([&resolutionFailed](const PeerId &, CHIP_ERROR) { resolutionFailed = true; });
+    handle.SetListener(&mNodeListener);
+
+    auto makeResolvedData = [&request](const Transport::PeerAddress & address, bool isFromCache) {
+        Dnssd::ResolvedNodeData resolvedData;
+        resolvedData.resolutionData.numIPs       = 1;
+        resolvedData.resolutionData.ipAddress[0] = address.GetIPAddress();
+        resolvedData.resolutionData.interfaceId  = address.GetInterface();
+        resolvedData.resolutionData.port         = address.GetPort();
+        resolvedData.resolutionData.isFromCache  = isFromCache;
+        resolvedData.operationalData.peerId      = request.GetPeerId();
+        return resolvedData;
+    };
+
+    auto cachedAddress = GetAddressWithLowScore(1);
+    resolver.OnOperationalNodeResolved(makeResolvedData(cachedAddress, true));
+
+    clock.AdvanceMonotonic(150_ms64);
+    resolver.OnOperationalNodeResolved(makeResolvedData(cachedAddress, true));
+
+    ASSERT_EQ(resolvedAddresses.size(), 1u);
+    EXPECT_EQ(resolvedAddresses[0], cachedAddress);
+    EXPECT_TRUE(handle.IsActive());
+
+    // Repeated delivery of the same cached record must not wake the listener
+    // again. The resolver remains active for a genuine fresh result.
+    clock.AdvanceMonotonic(100_ms64);
+    resolver.OnOperationalNodeResolved(makeResolvedData(cachedAddress, true));
+
+    ASSERT_EQ(resolvedAddresses.size(), 1u);
+    EXPECT_TRUE(handle.IsActive());
+
+    auto freshAddress = GetAddressWithLowScore(5);
+    resolver.OnOperationalNodeResolved(makeResolvedData(freshAddress, false));
+
+    ASSERT_EQ(resolvedAddresses.size(), 2u);
+    EXPECT_EQ(resolvedAddresses[1], freshAddress);
+    EXPECT_FALSE(handle.IsActive());
+    EXPECT_FALSE(resolutionFailed);
+}
+
+TEST_F(TestAddressResolveDefaultImplWithSystemLayerAndNodeListener, CachedResultRejectionAcceptsFreshResultForSameAddress)
+{
+    chip::Dnssd::Resolver::SetInstance(mockResolver);
+
+    chip::AddressResolve::Impl::Resolver resolver;
+    ASSERT_EQ(resolver.Init(&mSystemLayer), CHIP_NO_ERROR);
+
+    System::Clock::Internal::RAIIMockClock clock;
+    auto request = NodeLookupRequest(chip::PeerId(1, 2));
+    request.SetForceRefresh(true);
+    request.SetMinLookupTime(100_ms32);
+    request.SetMaxLookupTime(500_ms32);
+
+    AddressResolve::NodeLookupHandle handle;
+    ASSERT_EQ(resolver.LookupNode(request, handle), CHIP_NO_ERROR);
+
+    std::vector<Transport::PeerAddress> resolvedAddresses;
+    bool resolutionFailed = false;
+    mNodeListener.SetOnNodeAddressResolved(
+        [&resolvedAddresses](const PeerId &, const ResolveResult & result) { resolvedAddresses.push_back(result.address); });
+    mNodeListener.SetOnNodeAddressResolutionFailed([&resolutionFailed](const PeerId &, CHIP_ERROR) { resolutionFailed = true; });
+    handle.SetListener(&mNodeListener);
+
+    auto makeResolvedData = [&request](const Transport::PeerAddress & address, bool isFromCache) {
+        Dnssd::ResolvedNodeData resolvedData;
+        resolvedData.resolutionData.numIPs       = 1;
+        resolvedData.resolutionData.ipAddress[0] = address.GetIPAddress();
+        resolvedData.resolutionData.interfaceId  = address.GetInterface();
+        resolvedData.resolutionData.port         = address.GetPort();
+        resolvedData.resolutionData.isFromCache  = isFromCache;
+        resolvedData.operationalData.peerId      = request.GetPeerId();
+        return resolvedData;
+    };
+
+    auto cachedAddress = GetAddressWithLowScore(1);
+    resolver.OnOperationalNodeResolved(makeResolvedData(cachedAddress, true));
+    clock.AdvanceMonotonic(150_ms64);
+    resolver.OnOperationalNodeResolved(makeResolvedData(cachedAddress, true));
+
+    ASSERT_EQ(resolvedAddresses.size(), 1u);
+    EXPECT_EQ(resolvedAddresses[0], cachedAddress);
+    EXPECT_TRUE(handle.IsActive());
+
+    ASSERT_EQ(resolver.MarkCachedResultUnusable(handle), CHIP_NO_ERROR);
+    EXPECT_TRUE(handle.IsActive());
+
+    resolver.OnOperationalNodeResolved(makeResolvedData(cachedAddress, false));
+
+    ASSERT_EQ(resolvedAddresses.size(), 2u);
+    EXPECT_EQ(resolvedAddresses[1], cachedAddress);
+    EXPECT_FALSE(handle.IsActive());
+    EXPECT_FALSE(resolutionFailed);
+}
+
+TEST_F(TestAddressResolveDefaultImplWithSystemLayerAndNodeListener, RejectedCachedResultRestoresLookupTimeout)
+{
+    chip::Dnssd::Resolver::SetInstance(mockResolver);
+
+    chip::AddressResolve::Impl::Resolver resolver;
+    ASSERT_EQ(resolver.Init(&mSystemLayer), CHIP_NO_ERROR);
+
+    System::Clock::Internal::RAIIMockClock clock;
+    auto request = NodeLookupRequest(chip::PeerId(1, 2));
+    request.SetForceRefresh(true);
+    request.SetMinLookupTime(100_ms32);
+    request.SetMaxLookupTime(500_ms32);
+
+    System::Clock::Timeout timerDelay;
+    System::TimerCompleteCallback timerCallback = nullptr;
+    void * timerContext                         = nullptr;
+    mSystemLayer.mStartTimerCallback = [&timerDelay, &timerCallback, &timerContext](
+                                           System::Clock::Timeout delay, System::TimerCompleteCallback complete, void * context) {
+        timerDelay    = delay;
+        timerCallback = complete;
+        timerContext  = context;
+        return CHIP_NO_ERROR;
+    };
+
+    AddressResolve::NodeLookupHandle handle;
+    ASSERT_EQ(resolver.LookupNode(request, handle), CHIP_NO_ERROR);
+
+    bool resolutionFailed = false;
+    mNodeListener.SetOnNodeAddressResolutionFailed([&resolutionFailed](const PeerId &, CHIP_ERROR) { resolutionFailed = true; });
+    handle.SetListener(&mNodeListener);
+
+    auto makeResolvedData = [&request](const Transport::PeerAddress & address, bool isFromCache) {
+        Dnssd::ResolvedNodeData resolvedData;
+        resolvedData.resolutionData.numIPs       = 1;
+        resolvedData.resolutionData.ipAddress[0] = address.GetIPAddress();
+        resolvedData.resolutionData.interfaceId  = address.GetInterface();
+        resolvedData.resolutionData.port         = address.GetPort();
+        resolvedData.resolutionData.isFromCache  = isFromCache;
+        resolvedData.operationalData.peerId      = request.GetPeerId();
+        return resolvedData;
+    };
+
+    auto cachedAddress = GetAddressWithLowScore(1);
+    resolver.OnOperationalNodeResolved(makeResolvedData(cachedAddress, true));
+    clock.AdvanceMonotonic(150_ms64);
+    resolver.OnOperationalNodeResolved(makeResolvedData(cachedAddress, true));
+
+    ASSERT_TRUE(handle.IsActive());
+    ASSERT_EQ(resolver.MarkCachedResultUnusable(handle), CHIP_NO_ERROR);
+    ASSERT_TRUE(timerCallback != nullptr);
+    EXPECT_EQ(timerDelay, 350_ms32);
+
+    clock.AdvanceMonotonic(400_ms64);
+    timerCallback(&mSystemLayer, timerContext);
+
+    EXPECT_TRUE(resolutionFailed);
+    EXPECT_FALSE(handle.IsActive());
 }
 
 TEST_F(TestAddressResolveDefaultImplWithSystemLayerAndNodeListener, ResolverShutsDownAndClearsAllPendingLookups)

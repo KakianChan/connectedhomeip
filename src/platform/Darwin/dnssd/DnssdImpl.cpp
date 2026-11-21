@@ -258,16 +258,35 @@ static void OnGetAddrInfo(DNSServiceRef sdRef, DNSServiceFlags flags, uint32_t i
     ReturnOnFailure(MdnsContexts::GetInstance().Has(sdCtx));
     LogOnFailure(__func__, err);
 
+    const bool answeredFromCache = (flags & kDNSServiceFlagAnsweredFromCache) != 0;
+
+    bool cachedInterfaceChanged = false;
     if (kDNSServiceErr_NoError == err)
     {
         InterfaceKey interfaceKey = { interfaceId, hostname, contextWithType->isSRPResolve };
-        TEMPORARY_RETURN_IGNORED sdCtx->OnNewAddress(interfaceKey, address);
+        const bool fromCache      = sdCtx->mForceRefresh && answeredFromCache;
+        TEMPORARY_RETURN_IGNORED sdCtx->OnNewAddress(interfaceKey, address, fromCache);
+        cachedInterfaceChanged = fromCache && sdCtx->mFirstCachedAddressInterface.HasValue() &&
+            !(sdCtx->mLatestCachedAddressInterface.Value() == sdCtx->mFirstCachedAddressInterface.Value());
     }
 
     if (!(flags & kDNSServiceFlagsMoreComing))
     {
-        VerifyOrReturn(sdCtx->HasAddress(), TEMPORARY_RETURN_IGNORED sdCtx->Finalize(kDNSServiceErr_BadState));
-        TEMPORARY_RETURN_IGNORED sdCtx->Finalize();
+        if (sdCtx->HasAddress())
+        {
+            sdCtx->CancelCachedAddressFallbackTimer();
+            TEMPORARY_RETURN_IGNORED sdCtx->Finalize();
+        }
+        else if (cachedInterfaceChanged && sdCtx->PromoteLatestCachedAddress())
+        {
+            ChipLogProgress(Discovery, "Mdns: Using updated cached address for %s", StringOrNullMarker(hostname));
+            sdCtx->CancelCachedAddressFallbackTimer();
+            TEMPORARY_RETURN_IGNORED sdCtx->Finalize();
+        }
+        else if (!sdCtx->mForceRefresh || !sdCtx->HasCachedAddress())
+        {
+            TEMPORARY_RETURN_IGNORED sdCtx->Finalize(kDNSServiceErr_BadState);
+        }
     }
 }
 
@@ -282,14 +301,18 @@ static void GetAddrInfo(ResolveContext * sdCtx)
             continue;
         }
 
-        auto interfaceId = interface.first.interfaceId;
-        auto hostname    = interface.second.fullyQualifiedDomainName.c_str();
-        auto sdRefCopy   = sdCtx->serviceRef; // Mandatory copy because of kDNSServiceFlagsShareConnection
+        auto interfaceId      = interface.first.interfaceId;
+        auto hostname         = interface.second.fullyQualifiedDomainName.c_str();
+        auto sdRefCopy        = sdCtx->serviceRef; // Mandatory copy because of kDNSServiceFlagsShareConnection
+        DNSServiceFlags flags = kDNSServiceFlagsShareConnection;
+        if (sdCtx->mForceRefresh && !interface.first.isSRPResult)
+        {
+            flags |= kDNSServiceFlagsForceMulticast;
+        }
 
         ResolveContextWithType * contextWithType =
             (interface.first.isSRPResult) ? &sdCtx->resolveContextWithSRPType : &sdCtx->resolveContextWithNonSRPType;
-        auto err = DNSServiceGetAddrInfo(&sdRefCopy, kDNSServiceFlagsShareConnection, interfaceId, protocol, hostname,
-                                         OnGetAddrInfo, contextWithType);
+        auto err = DNSServiceGetAddrInfo(&sdRefCopy, flags, interfaceId, protocol, hostname, OnGetAddrInfo, contextWithType);
         VerifyOrReturn(kDNSServiceErr_NoError == err, TEMPORARY_RETURN_IGNORED sdCtx->Finalize(err));
         interface.second.isDNSLookUpRequested = true;
     }
@@ -323,18 +346,23 @@ static void OnResolve(DNSServiceRef sdRef, DNSServiceFlags flags, uint32_t inter
 }
 
 static CHIP_ERROR ResolveWithContext(ResolveContext * sdCtx, uint32_t interfaceId, const char * type, const char * name,
-                                     const char * domain, ResolveContextWithType * contextWithType)
+                                     const char * domain, ResolveContextWithType * contextWithType, bool forceRefresh)
 {
     auto sdRef = sdCtx->serviceRef; // Mandatory copy because of kDNSServiceFlagsShareConnection
 
-    auto err =
-        DNSServiceResolve(&sdRef, kDNSServiceFlagsShareConnection, interfaceId, name, type, domain, OnResolve, contextWithType);
+    DNSServiceFlags flags = kDNSServiceFlagsShareConnection;
+    if (forceRefresh && strcmp(domain, kLocalDot) == 0)
+    {
+        flags |= kDNSServiceFlagsForceMulticast;
+    }
+
+    auto err = DNSServiceResolve(&sdRef, flags, interfaceId, name, type, domain, OnResolve, contextWithType);
     VerifyOrReturnError(kDNSServiceErr_NoError == err, sdCtx->Finalize(err));
     return CHIP_NO_ERROR;
 }
 
 static CHIP_ERROR Resolve(ResolveContext * sdCtx, uint32_t interfaceId, chip::Inet::IPAddressType addressType, const char * type,
-                          const char * name, const char * domain)
+                          const char * name, const char * domain, bool forceRefresh)
 {
     ChipLogProgress(Discovery, "Resolve type=%s name=%s domain=%s interface=%" PRIu32, StringOrNullMarker(type),
                     StringOrNullMarker(name), StringOrNullMarker(domain), interfaceId);
@@ -353,12 +381,15 @@ static CHIP_ERROR Resolve(ResolveContext * sdCtx, uint32_t interfaceId, chip::In
     // ResolveWithContext guarantees it will Finalize() on failure.
     if (domain != nullptr)
     {
-        ReturnErrorOnFailure(ResolveWithContext(sdCtx, interfaceId, type, name, domain, &sdCtx->resolveContextWithNonSRPType));
+        ReturnErrorOnFailure(
+            ResolveWithContext(sdCtx, interfaceId, type, name, domain, &sdCtx->resolveContextWithNonSRPType, forceRefresh));
     }
     else
     {
-        ReturnErrorOnFailure(ResolveWithContext(sdCtx, interfaceId, type, name, kLocalDot, &sdCtx->resolveContextWithNonSRPType));
-        ReturnErrorOnFailure(ResolveWithContext(sdCtx, interfaceId, type, name, kSRPDot, &sdCtx->resolveContextWithNonSRPType));
+        ReturnErrorOnFailure(
+            ResolveWithContext(sdCtx, interfaceId, type, name, kLocalDot, &sdCtx->resolveContextWithNonSRPType, forceRefresh));
+        ReturnErrorOnFailure(
+            ResolveWithContext(sdCtx, interfaceId, type, name, kSRPDot, &sdCtx->resolveContextWithNonSRPType, forceRefresh));
     }
 
     auto retval = MdnsContexts::GetInstance().Add(sdCtx);
@@ -370,24 +401,25 @@ static CHIP_ERROR Resolve(ResolveContext * sdCtx, uint32_t interfaceId, chip::In
 }
 
 static CHIP_ERROR Resolve(void * context, DnssdResolveCallback callback, uint32_t interfaceId,
-                          chip::Inet::IPAddressType addressType, const char * type, const char * name, const char * domain)
+                          chip::Inet::IPAddressType addressType, const char * type, const char * name, const char * domain,
+                          bool forceRefresh)
 {
     auto counterHolder = GetCounterHolder(name);
-    auto sdCtx         = chip::Platform::New<ResolveContext>(context, callback, addressType, name,
-                                                     BrowseContext::sContextDispatchingSuccess, std::move(counterHolder));
+    auto sdCtx         = chip::Platform::New<ResolveContext>(
+        context, callback, addressType, name, BrowseContext::sContextDispatchingSuccess, std::move(counterHolder), forceRefresh);
     VerifyOrReturnError(nullptr != sdCtx, CHIP_ERROR_NO_MEMORY);
 
-    return Resolve(sdCtx, interfaceId, addressType, type, name, domain);
+    return Resolve(sdCtx, interfaceId, addressType, type, name, domain, forceRefresh);
 }
 
 static CHIP_ERROR Resolve(DiscoverNodeDelegate * delegate, uint32_t interfaceId, chip::Inet::IPAddressType addressType,
-                          const char * type, const char * name)
+                          const char * type, const char * name, bool forceRefresh)
 {
     auto counterHolder = GetCounterHolder(name);
-    auto sdCtx         = chip::Platform::New<ResolveContext>(delegate, addressType, name, std::move(counterHolder));
+    auto sdCtx         = chip::Platform::New<ResolveContext>(delegate, addressType, name, std::move(counterHolder), forceRefresh);
     VerifyOrReturnError(nullptr != sdCtx, CHIP_ERROR_NO_MEMORY);
 
-    return Resolve(sdCtx, interfaceId, addressType, type, name, nullptr);
+    return Resolve(sdCtx, interfaceId, addressType, type, name, nullptr, forceRefresh);
 }
 
 } // namespace
@@ -539,7 +571,8 @@ CHIP_ERROR ChipDnssdResolve(DnssdService * service, chip::Inet::InterfaceId inte
         }
     }
 
-    return Resolve(context, callback, interfaceId, service->mAddressType, regtype.c_str(), service->mName, domain);
+    return Resolve(context, callback, interfaceId, service->mAddressType, regtype.c_str(), service->mName, domain,
+                   service->mForceRefresh);
 }
 
 CHIP_ERROR ChipDnssdResolve(DnssdService * service, chip::Inet::InterfaceId interface, DiscoverNodeDelegate * delegate)
@@ -549,7 +582,7 @@ CHIP_ERROR ChipDnssdResolve(DnssdService * service, chip::Inet::InterfaceId inte
 
     auto regtype     = GetFullType(service);
     auto interfaceId = GetInterfaceId(interface);
-    return Resolve(delegate, interfaceId, service->mAddressType, regtype.c_str(), service->mName);
+    return Resolve(delegate, interfaceId, service->mAddressType, regtype.c_str(), service->mName, service->mForceRefresh);
 }
 
 void ChipDnssdResolveNoLongerNeeded(const char * instanceName)

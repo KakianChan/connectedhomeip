@@ -208,9 +208,29 @@ void OperationalSessionSetup::UpdateDeviceData(const ResolveResult & result)
     mTryingNextResultDueToSessionEstablishmentError     = false;
 #endif // CHIP_DEVICE_CONFIG_ENABLE_AUTOMATIC_CASE_RETRIES
 
-    if (mState == State::Uninitialized)
+    if (mState == State::Uninitialized || mState == State::SecureConnected)
     {
         return;
+    }
+
+    if (mState == State::Connecting)
+    {
+        if (mDeviceAddress == addr)
+        {
+            return;
+        }
+
+        char oldAddress[Transport::PeerAddress::kMaxToStringSize];
+        char newAddress[Transport::PeerAddress::kMaxToStringSize];
+        mDeviceAddress.ToString(oldAddress);
+        addr.ToString(newAddress);
+        ChipLogProgress(Discovery,
+                        "OperationalSessionSetup[%u:" ChipLogFormatX64
+                        "]: Received updated address %s while connecting to %s; restarting CASE with the updated address",
+                        mPeerId.GetFabricIndex(), ChipLogValueX64(mPeerId.GetNodeId()), newAddress, oldAddress);
+
+        // Discard the in-progress CASE exchange before trying the fresh address.
+        MoveToState(State::ResolvingAddress);
     }
 
 #if CHIP_DETAIL_LOGGING
@@ -277,6 +297,24 @@ void OperationalSessionSetup::UpdateDeviceData(const ResolveResult & result)
 #if CHIP_DEVICE_CONFIG_ENABLE_AUTOMATIC_CASE_RETRIES
     mTryingNextResultDueToSessionEstablishmentError = tryingNextResultDueToSessionEstablishmentError;
 #endif // CHIP_DEVICE_CONFIG_ENABLE_AUTOMATIC_CASE_RETRIES
+
+    const bool cachedAddressFailed =
+        result.isFromCache && (err == CHIP_ERROR_INVALID_ADDRESS || CHIP_CONFIG_IsPlatformErrorNonCritical(err));
+    if (cachedAddressFailed)
+    {
+        CHIP_ERROR markError = Resolver::Instance().MarkCachedResultUnusable(mAddressLookupHandle);
+        if (markError == CHIP_NO_ERROR)
+        {
+            ChipLogProgress(Discovery,
+                            "Cached address for " ChipLogFormatScopedNodeId " was unusable (%" CHIP_ERROR_FORMAT
+                            "); continuing fresh address discovery",
+                            ChipLogValueScopedNodeId(mPeerId), err.Format());
+            return;
+        }
+
+        ChipLogError(Discovery, "Failed to continue fresh address discovery: %" CHIP_ERROR_FORMAT, markError.Format());
+    }
+
     if (CHIP_NO_ERROR == Resolver::Instance().TryNextResult(mAddressLookupHandle))
     {
         // No need to NotifyRetryHandlers, since we never actually spent any
@@ -468,6 +506,23 @@ void OperationalSessionSetup::OnSessionEstablishmentError(CHIP_ERROR error, Sess
 #if CHIP_DEVICE_CONFIG_ENABLE_AUTOMATIC_CASE_RETRIES
         mTryingNextResultDueToSessionEstablishmentError = true;
 #endif // CHIP_DEVICE_CONFIG_ENABLE_AUTOMATIC_CASE_RETRIES
+
+        if (mAddressLookupHandle.IsActive() && mAddressLookupHandle.HasDeliveredCachedResult())
+        {
+            CHIP_ERROR markError = Resolver::Instance().MarkCachedResultUnusable(mAddressLookupHandle);
+            if (markError == CHIP_NO_ERROR)
+            {
+                ChipLogProgress(Discovery,
+                                "CASE failed for cached address of " ChipLogFormatScopedNodeId
+                                " (%" CHIP_ERROR_FORMAT "); discarding it and waiting for a fresh DNS-SD result",
+                                ChipLogValueScopedNodeId(mPeerId), error.Format());
+                return;
+            }
+
+            ChipLogError(Discovery, "Failed to discard cached address after CASE failure: %" CHIP_ERROR_FORMAT,
+                         markError.Format());
+        }
+
         if (CHIP_NO_ERROR == Resolver::Instance().TryNextResult(mAddressLookupHandle))
         {
             // Whatever work we needed to do has been handled by our
@@ -626,6 +681,11 @@ CHIP_ERROR OperationalSessionSetup::LookupPeerAddress()
     PeerId peerId(fabricInfo->GetCompressedFabricId(), mPeerId.GetNodeId());
 
     NodeLookupRequest request(peerId);
+    // Always keep the lookup active for a fresh DNS-SD answer, even when an
+    // address was served from the platform cache. A cached address may be
+    // stale after the device moves networks, and accepting it as the final
+    // result leaves no active lookup available to discover the replacement.
+    request.SetForceRefresh(true);
 
     CHIP_ERROR err = Resolver::Instance().LookupNode(request, mAddressLookupHandle);
 

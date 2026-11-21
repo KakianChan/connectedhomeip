@@ -32,9 +32,10 @@ static constexpr System::Clock::Timeout kInvalidTimeout{ System::Clock::Timeout:
 
 void NodeLookupHandle::ResetForLookup(System::Clock::Timestamp now, const NodeLookupRequest & request)
 {
-    mRequestStartTime = now;
-    mRequest          = request;
-    mResults          = NodeLookupResults();
+    mRequestStartTime         = now;
+    mRequest                  = request;
+    mResults                  = NodeLookupResults();
+    mHasDeliveredCachedResult = false;
 }
 
 void NodeLookupHandle::LookupResult(const ResolveResult & result)
@@ -88,6 +89,14 @@ System::Clock::Timeout NodeLookupHandle::NextEventTimeout(System::Clock::Timesta
         return System::Clock::Timeout::zero();
     }
 
+    if (HasDeliveredCachedResult())
+    {
+        // The platform keeps the resolver active for record updates. This
+        // lookup remains active until the session completes, the cached
+        // address is rejected, or the lookup is explicitly cancelled.
+        return kInvalidTimeout;
+    }
+
     if (elapsed < mRequest.GetMaxLookupTime())
     {
         return mRequest.GetMaxLookupTime() - elapsed;
@@ -121,6 +130,10 @@ NodeLookupAction NodeLookupHandle::NextAction(System::Clock::Timestamp now)
     // Give up if the maximum search time has been reached
     if (elapsed >= mRequest.GetMaxLookupTime())
     {
+        if (HasDeliveredCachedResult())
+        {
+            return NodeLookupAction::StopSearching();
+        }
         return NodeLookupAction::Error(CHIP_ERROR_TIMEOUT);
     }
 
@@ -206,7 +219,7 @@ CHIP_ERROR Resolver::LookupNode(const NodeLookupRequest & request, Impl::NodeLoo
 
     handle.ResetForLookup(mTimeSource.GetMonotonicTimestamp(), request);
     auto & peerId = request.GetPeerId();
-    ReturnErrorOnFailure(Dnssd::Resolver::Instance().ResolveNodeId(peerId));
+    ReturnErrorOnFailure(Dnssd::Resolver::Instance().ResolveNodeId(peerId, request.GetForceRefresh()));
     mActiveLookups.PushBack(&handle);
     ReArmTimer();
     ChipLogProgress(Discovery, "Lookup started for " ChipLogFormatPeerId, ChipLogValuePeerId(peerId));
@@ -225,6 +238,20 @@ CHIP_ERROR Resolver::TryNextResult(Impl::NodeLookupHandle & handle)
     MATTER_LOG_NODE_DISCOVERED(Tracing::DiscoveryInfoType::kRetryDifferent, &peerId, &result);
 
     listener->OnNodeAddressResolved(peerId, result);
+    return CHIP_NO_ERROR;
+}
+
+CHIP_ERROR Resolver::MarkCachedResultUnusable(Impl::NodeLookupHandle & handle)
+{
+    VerifyOrReturnError(mActiveLookups.Contains(&handle), CHIP_ERROR_INCORRECT_STATE);
+    VerifyOrReturnError(handle.HasDeliveredCachedResult(), CHIP_ERROR_INCORRECT_STATE);
+
+    handle.MarkCachedResultUnusable();
+
+    ChipLogProgress(Discovery, "Cached address rejected for " ChipLogFormatPeerId "; continuing fresh address discovery",
+                    ChipLogValuePeerId(handle.GetRequest().GetPeerId()));
+
+    ReArmTimer();
     return CHIP_NO_ERROR;
 }
 
@@ -312,6 +339,7 @@ void Resolver::OnOperationalNodeResolved(const Dnssd::ResolvedNodeData & nodeDat
         result.mrpRemoteConfig   = nodeData.resolutionData.GetRemoteMRPConfig();
         result.supportsTcpClient = nodeData.resolutionData.supportsTcpClient;
         result.supportsTcpServer = nodeData.resolutionData.supportsTcpServer;
+        result.isFromCache       = nodeData.resolutionData.isFromCache;
 
         if (nodeData.resolutionData.isICDOperatingAsLIT.has_value())
         {
@@ -348,8 +376,27 @@ void Resolver::HandleAction(IntrusiveList<NodeLookupHandle>::Iterator & current)
     }
 
     // final result, handle either success or failure
-    const PeerId peerId     = current->GetRequest().GetPeerId();
-    NodeListener * listener = current->GetListener();
+    const PeerId peerId                 = current->GetRequest().GetPeerId();
+    NodeListener * listener             = current->GetListener();
+    const bool hasDeliveredCachedResult = current->HasDeliveredCachedResult();
+
+    if (action.Type() == NodeLookupResult::kLookupSuccess && action.ResolveResult().isFromCache &&
+        current->GetRequest().GetForceRefresh())
+    {
+        if (hasDeliveredCachedResult)
+        {
+            ChipLogDetail(Discovery, "Ignoring repeated cached address for " ChipLogFormatPeerId,
+                          ChipLogValuePeerId(peerId));
+            return;
+        }
+
+        ChipLogProgress(Discovery, "Delivered cached address while continuing fresh discovery for " ChipLogFormatPeerId,
+                        ChipLogValuePeerId(peerId));
+        current->MarkCachedResultDelivered();
+        listener->OnNodeAddressResolved(peerId, action.ResolveResult());
+        return;
+    }
+
     mActiveLookups.Erase(current);
 
     Dnssd::Resolver::Instance().NodeIdResolutionNoLongerNeeded(peerId);
@@ -359,9 +406,14 @@ void Resolver::HandleAction(IntrusiveList<NodeLookupHandle>::Iterator & current)
     // contain the active lookup data as a member (intrusive lists members)
     switch (action.Type())
     {
+    case NodeLookupResult::kStopSearching:
+        break;
     case NodeLookupResult::kLookupError:
-        MATTER_LOG_NODE_DISCOVERY_FAILED(&peerId, action.ErrorResult());
-        listener->OnNodeAddressResolutionFailed(peerId, action.ErrorResult());
+        if (!hasDeliveredCachedResult)
+        {
+            MATTER_LOG_NODE_DISCOVERY_FAILED(&peerId, action.ErrorResult());
+            listener->OnNodeAddressResolutionFailed(peerId, action.ErrorResult());
+        }
         break;
     case NodeLookupResult::kLookupSuccess:
         MATTER_LOG_NODE_DISCOVERED(Tracing::DiscoveryInfoType::kResolutionDone, &peerId, &action.ResolveResult());
@@ -399,10 +451,16 @@ void Resolver::OnOperationalNodeResolutionFailed(const PeerId & peerId, CHIP_ERR
             continue;
         }
 
-        NodeListener * listener = current->GetListener();
+        NodeListener * listener                 = current->GetListener();
+        const bool alreadyDeliveredCachedResult = current->HasDeliveredCachedResult();
         mActiveLookups.Erase(current);
 
         Dnssd::Resolver::Instance().NodeIdResolutionNoLongerNeeded(peerId);
+
+        if (alreadyDeliveredCachedResult)
+        {
+            continue;
+        }
 
         // Failure callback only called after iterator was cleared:
         // This allows failure handlers to deallocate structures that may

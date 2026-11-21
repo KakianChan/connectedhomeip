@@ -83,7 +83,8 @@ namespace chip {
 namespace DeviceLayer {
 namespace Internal {
 
-constexpr uint16_t kMaxConnectRetries = 4;
+constexpr uint16_t kMaxConnectRetries = 6;
+constexpr useconds_t kConnectRetryDelayUsec = 500 * 1000;
 
 gboolean BluezEndpoint::BluezCharacteristicReadValue(BluezGattCharacteristic1 * aChar, GDBusMethodInvocation * aInvocation,
                                                      GVariant * aOptions)
@@ -616,8 +617,14 @@ CHIP_ERROR BluezEndpoint::ConnectDeviceImpl(BluezDevice1 & aDevice)
             break;
         }
 
-        ChipLogProgress(DeviceLayer, "ConnectDevice retry: %u out of %u", i + 1, kMaxConnectRetries);
+        if (i + 1 >= kMaxConnectRetries)
+        {
+            break;
+        }
+
+        ChipLogProgress(DeviceLayer, "ConnectDevice retry: %u out of %u", i + 1, kMaxConnectRetries - 1);
         bluez_device1_call_disconnect_sync(&aDevice, nullptr, nullptr);
+        usleep(kConnectRetryDelayUsec);
     }
 
     BLEManagerImpl::HandleConnectFailed(CHIP_ERROR_INTERNAL);

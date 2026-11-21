@@ -116,7 +116,7 @@ public:
     CHIP_ERROR StopBrowse(intptr_t browseIdentifier);
     CHIP_ERROR Resolve(const char * name, const char * type, DnssdServiceProtocol protocol, chip::Inet::IPAddressType addressType,
                        chip::Inet::IPAddressType transportType, chip::Inet::InterfaceId interface, DnssdResolveCallback callback,
-                       void * context);
+                       void * context, bool forceRefresh);
     void StopResolve(const char * name);
 
     Poller & GetPoller() { return mPoller; }
@@ -150,16 +150,12 @@ private:
         AvahiProtocol mAddressType;
         std::string mFullType;
         uint8_t mAttempts                = 0;
+        bool mForceRefresh               = false;
+        bool mDeliveredCachedResult      = false;
+        AvahiLookupFlags mLookupFlags    = static_cast<AvahiLookupFlags>(0);
         AvahiServiceResolver * mResolver = nullptr;
 
-        ~ResolveContext()
-        {
-            if (mResolver != nullptr)
-            {
-                avahi_service_resolver_free(mResolver);
-                mResolver = nullptr;
-            }
-        }
+        ~ResolveContext();
     };
 
     MdnsAvahi() : mClient(nullptr) {}
@@ -186,7 +182,6 @@ private:
                               AvahiResolverEvent event, const char * name, const char * type, const char * domain,
                               const char * host_name, const AvahiAddress * address, uint16_t port, AvahiStringList * txt,
                               AvahiLookupResultFlags flags, void * userdata);
-
     DnssdAsyncReturnCallback mInitCallback;
     DnssdAsyncReturnCallback mErrorCallback;
     void * mAsyncReturnContext;

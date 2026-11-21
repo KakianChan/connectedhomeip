@@ -52,7 +52,8 @@ public:
 
     // Members that implement Resolver interface.
     void SetOperationalDelegate(OperationalResolveDelegate * delegate) override { mOperationalDelegate = delegate; }
-    CHIP_ERROR ResolveNodeId(const PeerId & peerId) override;
+    CHIP_ERROR ResolveNodeId(const PeerId & peerId) override { return ResolveNodeId(peerId, false); }
+    CHIP_ERROR ResolveNodeId(const PeerId & peerId, bool forceRefresh) override;
     void NodeIdResolutionNoLongerNeeded(const PeerId & peerId) override;
     CHIP_ERROR DiscoverCommissionableNodes(DiscoveryFilter filter, DiscoveryContext & context);
     CHIP_ERROR DiscoverCommissioners(DiscoveryFilter filter, DiscoveryContext & context);

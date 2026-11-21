@@ -151,6 +151,12 @@ public:
      */
     virtual CHIP_ERROR ResolveNodeId(const PeerId & peerId) = 0;
 
+    /**
+     * Requests resolution with control over use of the platform DNS-SD cache.
+     * Backends that support cache refresh should override this overload.
+     */
+    virtual CHIP_ERROR ResolveNodeId(const PeerId & peerId, bool /* forceRefresh */) { return ResolveNodeId(peerId); }
+
     /*
      * Notify the resolver that one of the consumers that called ResolveNodeId
      * successfully no longer needs the resolution result (e.g. because it got

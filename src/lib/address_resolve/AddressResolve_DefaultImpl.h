@@ -31,6 +31,7 @@ inline constexpr uint8_t kNodeLookupResultsLen = CHIP_CONFIG_MDNS_RESOLVE_LOOKUP
 enum class NodeLookupResult
 {
     kKeepSearching, // keep the current search active
+    kStopSearching, // final status: stop without notifying the listener
     kLookupError,   // final status: error
     kLookupSuccess, // final status: success
 };
@@ -49,6 +50,19 @@ struct NodeLookupResults
     {
         VerifyOrDie(HasValidResult());
         return results[consumed++];
+    }
+
+    /// Remove results that were already returned to the caller so they can be
+    /// considered again if a later, fresh DNS-SD answer contains the address.
+    void DiscardConsumedResults()
+    {
+        VerifyOrDie(consumed <= count);
+        for (uint8_t i = consumed; i < count; i++)
+        {
+            results[i - consumed] = results[i];
+        }
+        count -= consumed;
+        consumed = 0;
     }
 
 #if CHIP_DETAIL_LOGGING
@@ -82,6 +96,7 @@ public:
         case NodeLookupResult::kLookupSuccess:
             mResult.result = other.mResult.result;
             break;
+        case NodeLookupResult::kStopSearching:
         case NodeLookupResult::kKeepSearching:
             // no data is important here
             break;
@@ -90,6 +105,7 @@ public:
     }
 
     static NodeLookupAction KeepSearching() { return NodeLookupAction(NodeLookupResult::kKeepSearching); }
+    static NodeLookupAction StopSearching() { return NodeLookupAction(NodeLookupResult::kStopSearching); }
 
     static NodeLookupAction Error(CHIP_ERROR err)
     {
@@ -153,6 +169,14 @@ public:
     /// Return the next valid lookup result.
     ResolveResult TakeLookupResult() { return mResults.ConsumeResult(); }
 
+    void MarkCachedResultDelivered() { mHasDeliveredCachedResult = true; }
+    bool HasDeliveredCachedResult() const { return mHasDeliveredCachedResult; }
+    void MarkCachedResultUnusable()
+    {
+        mHasDeliveredCachedResult = false;
+        mResults.DiscardConsumedResults();
+    }
+
     /// Return when the next timer (min or max lookup time) is required to
     /// be triggered for this lookup handle
     System::Clock::Timeout NextEventTimeout(System::Clock::Timestamp now);
@@ -161,6 +185,7 @@ private:
     NodeLookupResults mResults;
     NodeLookupRequest mRequest; // active request to process
     System::Clock::Timestamp mRequestStartTime;
+    bool mHasDeliveredCachedResult = false;
 };
 
 class Resolver : public ::chip::AddressResolve::Resolver, public Dnssd::OperationalResolveDelegate
@@ -173,6 +198,7 @@ public:
     CHIP_ERROR Init(System::Layer * systemLayer) override;
     CHIP_ERROR LookupNode(const NodeLookupRequest & request, Impl::NodeLookupHandle & handle) override;
     CHIP_ERROR TryNextResult(Impl::NodeLookupHandle & handle) override;
+    CHIP_ERROR MarkCachedResultUnusable(Impl::NodeLookupHandle & handle) override;
     CHIP_ERROR CancelLookup(Impl::NodeLookupHandle & handle, FailureCallback cancel_method) override;
     void Shutdown() override;
 

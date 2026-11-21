@@ -30,8 +30,9 @@ using namespace chip::Dnssd::Internal;
 
 namespace {
 
-constexpr uint8_t kDnssdKeyMaxSize          = 32;
-constexpr uint8_t kDnssdTxtRecordMaxEntries = 20;
+constexpr uint8_t kDnssdKeyMaxSize                                   = 32;
+constexpr uint8_t kDnssdTxtRecordMaxEntries                          = 20;
+constexpr chip::System::Clock::Timeout kCachedAddressFallbackTimeout = chip::System::Clock::Seconds16(15);
 
 std::string GetHostNameWithoutDomain(const char * hostnameWithDomain)
 {
@@ -539,8 +540,8 @@ void BrowseWithDelegateContext::OnBrowseRemove(const char * name, const char * t
 
 ResolveContext::ResolveContext(void * cbContext, DnssdResolveCallback cb, chip::Inet::IPAddressType cbAddressType,
                                const char * instanceNameToResolve, BrowseContext * browseCausingResolve,
-                               std::shared_ptr<uint32_t> && consumerCounterToUse) :
-    browseThatCausedResolve(browseCausingResolve)
+                               std::shared_ptr<uint32_t> && consumerCounterToUse, bool forceRefresh) :
+    browseThatCausedResolve(browseCausingResolve), mForceRefresh(forceRefresh)
 {
     type            = ContextType::Resolve;
     context         = cbContext;
@@ -551,8 +552,8 @@ ResolveContext::ResolveContext(void * cbContext, DnssdResolveCallback cb, chip::
 }
 
 ResolveContext::ResolveContext(DiscoverNodeDelegate * delegate, chip::Inet::IPAddressType cbAddressType,
-                               const char * instanceNameToResolve, std::shared_ptr<uint32_t> && consumerCounterToUse) :
-    browseThatCausedResolve(nullptr)
+                               const char * instanceNameToResolve, std::shared_ptr<uint32_t> && consumerCounterToUse,
+                               bool forceRefresh) : browseThatCausedResolve(nullptr), mForceRefresh(forceRefresh)
 {
     type            = ContextType::Resolve;
     context         = delegate;
@@ -700,7 +701,7 @@ void ResolveContext::DispatchSuccess()
                             instanceName.c_str()));
 }
 
-CHIP_ERROR ResolveContext::OnNewAddress(const InterfaceKey & interfaceKey, const struct sockaddr * address)
+CHIP_ERROR ResolveContext::OnNewAddress(const InterfaceKey & interfaceKey, const struct sockaddr * address, bool fromCache)
 {
     // If we don't have any information about this interfaceId, just ignore the
     // address, since it won't be usable anyway without things like the port.
@@ -734,7 +735,22 @@ CHIP_ERROR ResolveContext::OnNewAddress(const InterfaceKey & interfaceKey, const
         return CHIP_NO_ERROR;
     }
 
-    interfaces[interfaceKey].addresses.push_back(ip);
+    auto & interface = interfaces[interfaceKey];
+    if (fromCache)
+    {
+        interface.cachedAddresses.push_back(ip);
+        if (!mFirstCachedAddressInterface.HasValue())
+        {
+            mFirstCachedAddressInterface.SetValue(interfaceKey);
+        }
+        mLatestCachedAddressInterface.SetValue(interfaceKey);
+        StartCachedAddressFallbackTimer();
+    }
+    else
+    {
+        interface.cachedAddresses.clear();
+        interface.addresses.push_back(ip);
+    }
 
     return CHIP_NO_ERROR;
 }
@@ -750,6 +766,72 @@ bool ResolveContext::HasAddress()
     }
 
     return false;
+}
+
+bool ResolveContext::HasCachedAddress()
+{
+    for (auto & interface : interfaces)
+    {
+        if (interface.second.cachedAddresses.size())
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool ResolveContext::PromoteLatestCachedAddress()
+{
+    VerifyOrReturnError(mLatestCachedAddressInterface.HasValue(), false);
+    auto interface = interfaces.find(mLatestCachedAddressInterface.Value());
+    VerifyOrReturnError(interface != interfaces.end(), false);
+    VerifyOrReturnError(!interface->second.cachedAddresses.empty(), false);
+
+    interface->second.addresses = std::move(interface->second.cachedAddresses);
+    return true;
+}
+
+void ResolveContext::StartCachedAddressFallbackTimer()
+{
+    VerifyOrReturn(!mCachedAddressFallbackTimerStarted);
+
+    CHIP_ERROR err = DeviceLayer::SystemLayer().StartTimer(kCachedAddressFallbackTimeout, OnCachedAddressFallbackTimeout, this);
+    if (err == CHIP_NO_ERROR)
+    {
+        mCachedAddressFallbackTimerStarted = true;
+    }
+    else
+    {
+        ChipLogError(Discovery, "Failed to start cached address fallback timer: %" CHIP_ERROR_FORMAT, err.Format());
+    }
+}
+
+void ResolveContext::CancelCachedAddressFallbackTimer()
+{
+    VerifyOrReturn(mCachedAddressFallbackTimerStarted);
+    DeviceLayer::SystemLayer().CancelTimer(OnCachedAddressFallbackTimeout, this);
+    mCachedAddressFallbackTimerStarted = false;
+}
+
+void ResolveContext::OnCachedAddressFallbackTimeout(System::Layer * systemLayer, void * appState)
+{
+    auto * self                              = static_cast<ResolveContext *>(appState);
+    self->mCachedAddressFallbackTimerStarted = false;
+
+    if (MdnsContexts::GetInstance().Has(self) != CHIP_NO_ERROR)
+    {
+        return;
+    }
+
+    if (self->HasAddress() || self->PromoteLatestCachedAddress())
+    {
+        ChipLogProgress(Discovery, "Mdns: Using cached address for %s after refresh timeout", self->instanceName.c_str());
+        TEMPORARY_RETURN_IGNORED self->Finalize();
+        return;
+    }
+
+    TEMPORARY_RETURN_IGNORED self->Finalize(CHIP_ERROR_TIMEOUT);
 }
 
 void ResolveContext::OnNewInterface(uint32_t interfaceId, const char * fullname, const char * hostnameWithDomain, uint16_t port,

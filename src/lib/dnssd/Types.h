@@ -102,6 +102,7 @@ struct CommonResolutionData
     char hostName[kHostNameMaxLength + 1] = {};
     bool supportsTcpClient                = false;
     bool supportsTcpServer                = false;
+    bool isFromCache                      = false;
     std::optional<bool> isICDOperatingAsLIT;
     std::optional<System::Clock::Milliseconds32> mrpRetryIntervalIdle;
     std::optional<System::Clock::Milliseconds32> mrpRetryIntervalActive;
@@ -144,6 +145,7 @@ struct CommonResolutionData
         port                    = 0;
         supportsTcpClient       = false;
         supportsTcpServer       = false;
+        isFromCache             = false;
         interfaceId             = Inet::InterfaceId::Null();
         for (auto & addr : ipAddress)
         {

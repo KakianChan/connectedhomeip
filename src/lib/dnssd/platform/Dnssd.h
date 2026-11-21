@@ -79,6 +79,10 @@ struct DnssdService
     const char ** mSubTypes;
     size_t mSubTypeSize;
     std::optional<chip::Inet::IPAddress> mAddress;
+    // Request a network refresh instead of returning a cached resolve result.
+    bool mForceRefresh = false;
+    // Indicates that this result was supplied by the platform DNS-SD cache.
+    bool mIsFromCache = false;
     // Time to live in seconds. Per rfc6762 section 10, because we have a hostname, our default TTL is 120 seconds
     uint32_t mTtlSeconds = 120;
 

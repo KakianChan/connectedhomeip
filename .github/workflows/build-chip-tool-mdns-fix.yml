@@ -1,0 +1,58 @@
+name: Build ARM64 chip-tool mDNS fix
+
+on:
+    workflow_dispatch:
+    push:
+        branches:
+            - chip-tool-mdns-fix
+
+permissions:
+    contents: read
+
+jobs:
+    build:
+        runs-on: ubuntu-24.04-arm
+        timeout-minutes: 120
+
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+
+            - name: Checkout submodules & Bootstrap
+              uses: ./.github/actions/checkout-submodules-and-bootstrap
+              with:
+                  platform: linux
+                  bootstrap-log-name: bootstrap-logs-arm64-chip-tool-mdns-fix
+
+            - name: Check formatting
+              run: |
+                  scripts/run_in_build_env.sh "
+                    scripts/helpers/clang-format-check.sh
+                    src/app/OperationalSessionSetup.cpp
+                    src/lib/address_resolve/AddressResolve_DefaultImpl.cpp
+                    src/lib/address_resolve/AddressResolve_DefaultImpl.h
+                    src/lib/address_resolve/tests/TestAddressResolve_DefaultImpl.cpp
+                    src/platform/Linux/DnssdImpl.cpp
+                    src/platform/Linux/DnssdImpl.h
+                  "
+
+            - name: Build chip-tool
+              run: ./scripts/build/build_examples.py --target linux-arm64-chip-tool build
+
+            - name: Build and run address resolution test
+              run: |
+                  scripts/run_in_build_env.sh "ninja -C out/linux-arm64-chip-tool src/lib/address_resolve/tests:TestAddressResolve_DefaultImpl"
+                  scripts/run_in_build_env.sh "out/linux-arm64-chip-tool/tests/TestAddressResolve_DefaultImpl"
+
+            - name: Package chip-tool
+              run: |
+                  mkdir -p artifact
+                  cp out/linux-arm64-chip-tool/chip-tool artifact/chip-tool
+                  strip artifact/chip-tool
+                  sha256sum artifact/chip-tool > artifact/SHA256SUMS
+
+            - name: Upload chip-tool
+              uses: actions/upload-artifact@v4
+              with:
+                  name: chip-tool-linux-arm64-mdns-fix
+                  path: artifact/

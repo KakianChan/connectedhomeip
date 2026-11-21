@@ -36,6 +36,7 @@ struct ResolveResult
     bool supportsTcpServer   = false;
     bool supportsTcpClient   = false;
     bool isICDOperatingAsLIT = false;
+    bool isFromCache         = false;
 
     ResolveResult() : address(Transport::Type::kUdp), mrpRemoteConfig(GetDefaultMRPConfig()) {}
 };
@@ -47,8 +48,10 @@ public:
     NodeListener()          = default;
     virtual ~NodeListener() = default;
 
-    /// Callback executed once only for a lookup, when the final address of a
-    /// node is considered to be the best choice for reachability.
+    /// Callback executed when an address of a node is considered usable.
+    ///
+    /// For a forced-refresh lookup this may be called first with a cached
+    /// address and then again if a different fresh address is discovered.
     ///
     /// The callback is expected to be executed within the CHIP event loop
     /// thread.
@@ -105,6 +108,16 @@ public:
     const PeerId & GetPeerId() const { return mPeerId; }
     System::Clock::Milliseconds32 GetMinLookupTime() const { return mMinLookupTimeMs; }
     System::Clock::Milliseconds32 GetMaxLookupTime() const { return mMaxLookupTimeMs; }
+    bool GetForceRefresh() const { return mForceRefresh; }
+
+    /// Prefer a fresh network answer. A cached answer may be delivered first
+    /// so callers can start connecting immediately, followed by a fresh answer
+    /// if the network result differs.
+    NodeLookupRequest & SetForceRefresh(bool value)
+    {
+        mForceRefresh = value;
+        return *this;
+    }
 
     /// The minimum lookup time is how much to wait for additional DNSSD
     /// queries even if a reply has already been received or to allow for
@@ -155,6 +168,7 @@ private:
     PeerId mPeerId;
     System::Clock::Milliseconds32 mMinLookupTimeMs{ kMinLookupTimeMsDefault };
     System::Clock::Milliseconds32 mMaxLookupTimeMs{ kMaxLookupTimeMsDefault };
+    bool mForceRefresh = false;
 };
 
 /// These things are expected to be defined by the implementation header.
@@ -203,8 +217,10 @@ public:
     /// Lookup handle to keep track of node resolution
     ///
     /// If this returns CHIP_NO_ERROR, the following is expected:
-    ///   - exactly one of the listener OnNodeAddressResolved
-    ///     or OnNodeAddressResolutionFailed will be called at a later time
+    ///   - at least one of the listener OnNodeAddressResolved
+    ///     or OnNodeAddressResolutionFailed will be called at a later time;
+    ///     forced-refresh lookups may report a cached result followed by a
+    ///     fresh result before the lookup becomes inactive
     ///   - handle must NOT be destroyed while the lookup is in progress (it
     ///     is part of an internal 'lookup list')
     ///   - handle must NOT be reused (the lookup is done on a per-node basis
@@ -237,6 +253,17 @@ public:
     ///
     /// This method may return other errors in some cases.
     virtual CHIP_ERROR TryNextResult(Impl::NodeLookupHandle & handle) = 0;
+
+    /// Marks a cached result from a forced-refresh lookup as unusable.
+    ///
+    /// The lookup remains active so it can continue waiting for a fresh DNS-SD
+    /// result. The normal maximum lookup timeout is restored, so the lookup
+    /// still fails if no fresh result becomes available.
+    ///
+    /// This method must be called on an active handle that has already
+    /// delivered a cached result. It returns CHIP_ERROR_INCORRECT_STATE
+    /// otherwise.
+    virtual CHIP_ERROR MarkCachedResultUnusable(Impl::NodeLookupHandle & handle) = 0;
 
     /// Stops an active lookup request.
     ///

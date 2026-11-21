@@ -146,6 +146,15 @@ namespace Dnssd {
 
 MdnsAvahi MdnsAvahi::sInstance;
 
+MdnsAvahi::ResolveContext::~ResolveContext()
+{
+    if (mResolver != nullptr)
+    {
+        avahi_service_resolver_free(mResolver);
+        mResolver = nullptr;
+    }
+}
+
 Poller::Poller()
 {
     mAvahiPoller.userdata         = this;
@@ -904,7 +913,7 @@ void MdnsAvahi::StopResolve(const char * name)
 
 CHIP_ERROR MdnsAvahi::Resolve(const char * name, const char * type, DnssdServiceProtocol protocol, Inet::IPAddressType addressType,
                               Inet::IPAddressType transportType, Inet::InterfaceId interface, DnssdResolveCallback callback,
-                              void * context)
+                              void * context, bool forceRefresh)
 {
     AvahiIfIndex avahiInterface     = static_cast<AvahiIfIndex>(interface.GetPlatformInterface());
     ResolveContext * resolveContext = AllocateResolveContext();
@@ -924,14 +933,22 @@ CHIP_ERROR MdnsAvahi::Resolve(const char * name, const char * type, DnssdService
     }
 
     Platform::CopyString(resolveContext->mName, name);
-    resolveContext->mInterface   = avahiInterface;
-    resolveContext->mTransport   = ToAvahiProtocol(transportType);
-    resolveContext->mAddressType = ToAvahiProtocol(addressType);
-    resolveContext->mFullType    = GetFullType(type, protocol);
+    resolveContext->mInterface    = avahiInterface;
+    resolveContext->mTransport    = ToAvahiProtocol(transportType);
+    resolveContext->mAddressType  = ToAvahiProtocol(addressType);
+    resolveContext->mFullType     = GetFullType(type, protocol);
+    resolveContext->mForceRefresh = forceRefresh;
+    if (forceRefresh)
+    {
+        // Avahi 0.8 has no public no-cache lookup flag. Use a multicast lookup
+        // and keep the resolver open so a cached result can be used
+        // provisionally while a fresh record update is awaited.
+        resolveContext->mLookupFlags = static_cast<AvahiLookupFlags>(AVAHI_LOOKUP_USE_MULTICAST);
+    }
 
     resolveContext->mResolver =
         avahi_service_resolver_new(mClient, avahiInterface, resolveContext->mTransport, name, resolveContext->mFullType.c_str(),
-                                   nullptr, resolveContext->mAddressType, static_cast<AvahiLookupFlags>(0), HandleResolve,
+                                   nullptr, resolveContext->mAddressType, resolveContext->mLookupFlags, HandleResolve,
                                    reinterpret_cast<void *>(resolveContext->mNumber));
     // Otherwise the resolver will be freed in the callback
     if (resolveContext->mResolver == nullptr)
@@ -965,9 +982,9 @@ void MdnsAvahi::HandleResolve(AvahiServiceResolver * resolver, AvahiIfIndex inte
         {
             ChipLogProgress(DeviceLayer, "Re-trying resolve");
             avahi_service_resolver_free(resolver);
-            context->mResolver = avahi_service_resolver_new(
-                context->mInstance->mClient, context->mInterface, context->mTransport, context->mName, context->mFullType.c_str(),
-                nullptr, context->mAddressType, static_cast<AvahiLookupFlags>(0), HandleResolve, userdata);
+            context->mResolver = avahi_service_resolver_new(context->mInstance->mClient, context->mInterface, context->mTransport,
+                                                            context->mName, context->mFullType.c_str(), nullptr,
+                                                            context->mAddressType, context->mLookupFlags, HandleResolve, userdata);
             if (context->mResolver == nullptr)
             {
                 ChipLogError(DeviceLayer, "Avahi resolve failed on retry");
@@ -981,6 +998,17 @@ void MdnsAvahi::HandleResolve(AvahiServiceResolver * resolver, AvahiIfIndex inte
         break;
     case AVAHI_RESOLVER_FOUND:
         DnssdService result = {};
+        result.mIsFromCache = (flags & AVAHI_LOOKUP_RESULT_CACHED) != 0;
+
+        // avahi_service_resolver_new() reports a cached result immediately and
+        // then keeps the resolver active for later record changes. Deliver the
+        // cache result once, but keep the resolver open so a fresh address can
+        // replace it without polling or repeatedly waking upper layers.
+        if (context->mForceRefresh && result.mIsFromCache && context->mDeliveredCachedResult)
+        {
+            ChipLogDetail(Discovery, "Avahi resolver still using cached result for %s", name);
+            return;
+        }
 
         ChipLogProgress(DeviceLayer, "Avahi resolve found");
 
@@ -1053,6 +1081,11 @@ void MdnsAvahi::HandleResolve(AvahiServiceResolver * resolver, AvahiIfIndex inte
         }
         result.mTextEntrySize = textEntries.size();
 
+        if (context->mForceRefresh && result.mIsFromCache)
+        {
+            context->mDeliveredCachedResult = true;
+        }
+
         if (result_err == CHIP_NO_ERROR)
         {
             context->mCallback(context->mContext, &result, Span<Inet::IPAddress>(&ipAddress, 1), CHIP_NO_ERROR);
@@ -1061,6 +1094,13 @@ void MdnsAvahi::HandleResolve(AvahiServiceResolver * resolver, AvahiIfIndex inte
         {
             context->mCallback(context->mContext, nullptr, Span<Inet::IPAddress>(), result_err);
         }
+
+        if (result.mIsFromCache)
+        {
+            ChipLogProgress(Discovery, "Delivered cached Avahi result for %s; waiting for a fresh address update", name);
+            return;
+        }
+
         break;
     }
 
@@ -1118,7 +1158,8 @@ CHIP_ERROR ChipDnssdResolve(DnssdService * browseResult, chip::Inet::InterfaceId
     VerifyOrReturnError(browseResult != nullptr, CHIP_ERROR_INVALID_ARGUMENT);
 
     return MdnsAvahi::GetInstance().Resolve(browseResult->mName, browseResult->mType, browseResult->mProtocol,
-                                            browseResult->mAddressType, Inet::IPAddressType::kAny, interface, callback, context);
+                                            browseResult->mAddressType, Inet::IPAddressType::kAny, interface, callback, context,
+                                            browseResult->mForceRefresh);
 }
 
 void ChipDnssdResolveNoLongerNeeded(const char * instanceName)

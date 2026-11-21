@@ -361,6 +361,7 @@ void DiscoveryImplPlatform::HandleNodeIdResolve(void * context, DnssdService * r
     nodeData.resolutionData.interfaceId = result->mInterface;
     nodeData.resolutionData.port        = result->mPort;
     nodeData.operationalData.peerId     = peerId;
+    nodeData.resolutionData.isFromCache = result->mIsFromCache;
 
     size_t addressesFound = 0;
     for (auto & ip : addresses)
@@ -685,7 +686,7 @@ bool DiscoveryImplPlatform::IsInitialized()
     return mState == State::kInitialized;
 }
 
-CHIP_ERROR DiscoveryImplPlatform::ResolveNodeId(const PeerId & peerId)
+CHIP_ERROR DiscoveryImplPlatform::ResolveNodeId(const PeerId & peerId, bool forceRefresh)
 {
     // Resolve requests can only be issued once DNSSD is initialized and there is
     // no caching currently
@@ -698,8 +699,9 @@ CHIP_ERROR DiscoveryImplPlatform::ResolveNodeId(const PeerId & peerId)
 
     ReturnErrorOnFailure(MakeInstanceName(service.mName, sizeof(service.mName), peerId));
     Platform::CopyString(service.mType, kOperationalServiceName);
-    service.mProtocol    = DnssdServiceProtocol::kDnssdProtocolTcp;
-    service.mAddressType = Inet::IPAddressType::kAny;
+    service.mProtocol     = DnssdServiceProtocol::kDnssdProtocolTcp;
+    service.mAddressType  = Inet::IPAddressType::kAny;
+    service.mForceRefresh = forceRefresh;
 
     return ChipDnssdResolve(&service, Inet::InterfaceId::Null(), HandleNodeIdResolve, this);
 }

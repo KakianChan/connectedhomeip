@@ -235,6 +235,7 @@ struct InterfaceInfo
 
     DnssdService service;
     std::vector<Inet::IPAddress> addresses;
+    std::vector<Inet::IPAddress> cachedAddresses;
     std::string fullyQualifiedDomainName;
     bool isDNSLookUpRequested = false;
     bool HasAddresses() const { return addresses.size() != 0; };
@@ -279,6 +280,10 @@ struct ResolveContext : public GenericContext
     std::string instanceName;
     std::shared_ptr<uint32_t> consumerCounter;
     BrowseContext * const browseThatCausedResolve; // Can be null
+    bool mForceRefresh;
+    bool mCachedAddressFallbackTimerStarted = false;
+    Optional<InterfaceKey> mFirstCachedAddressInterface;
+    Optional<InterfaceKey> mLatestCachedAddressInterface;
 
     ResolveContextWithType resolveContextWithSRPType    = { this, true };
     ResolveContextWithType resolveContextWithNonSRPType = { this, false };
@@ -286,15 +291,21 @@ struct ResolveContext : public GenericContext
     // browseCausingResolve can be null.
     ResolveContext(void * cbContext, DnssdResolveCallback cb, chip::Inet::IPAddressType cbAddressType,
                    const char * instanceNameToResolve, BrowseContext * browseCausingResolve,
-                   std::shared_ptr<uint32_t> && consumerCounterToUse);
+                   std::shared_ptr<uint32_t> && consumerCounterToUse, bool forceRefresh);
     ResolveContext(DiscoverNodeDelegate * delegate, chip::Inet::IPAddressType cbAddressType, const char * instanceNameToResolve,
-                   std::shared_ptr<uint32_t> && consumerCounterToUse);
+                   std::shared_ptr<uint32_t> && consumerCounterToUse, bool forceRefresh);
+    ~ResolveContext() override { CancelCachedAddressFallbackTimer(); }
 
     void DispatchFailure(const char * errorStr, CHIP_ERROR err) override;
     void DispatchSuccess() override;
 
-    CHIP_ERROR OnNewAddress(const InterfaceKey & interfaceKey, const struct sockaddr * address);
+    CHIP_ERROR OnNewAddress(const InterfaceKey & interfaceKey, const struct sockaddr * address, bool fromCache);
     bool HasAddress();
+    bool HasCachedAddress();
+    bool PromoteLatestCachedAddress();
+    void StartCachedAddressFallbackTimer();
+    void CancelCachedAddressFallbackTimer();
+    static void OnCachedAddressFallbackTimeout(System::Layer * systemLayer, void * appState);
 
     void OnNewInterface(uint32_t interfaceId, const char * fullname, const char * hostname, uint16_t port, uint16_t txtLen,
                         const unsigned char * txtRecord, bool isSRPResult);
