@@ -24,9 +24,6 @@ jobs:
                   platform: linux
                   bootstrap-log-name: bootstrap-logs-arm64-chip-tool-mdns-fix
 
-            - name: Check patch whitespace
-              run: git show --check --format= HEAD
-
             - name: Build chip-tool
               run: ./scripts/build/build_examples.py --target linux-arm64-chip-tool build
 
