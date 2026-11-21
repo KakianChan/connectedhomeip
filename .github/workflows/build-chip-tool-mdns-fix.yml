@@ -28,11 +28,11 @@ jobs:
               run: |
                   sudo apt-get update
                   sudo apt-get install -y \
-                    gdbus-codegen \
                     libavahi-client-dev \
                     libdbus-1-dev \
                     libevent-dev \
                     libglib2.0-dev \
+                    libglib2.0-dev-bin \
                     libpcsclite-dev
 
             - name: Build chip-tool
