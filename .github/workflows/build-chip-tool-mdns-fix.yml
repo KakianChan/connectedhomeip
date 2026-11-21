@@ -36,7 +36,7 @@ jobs:
                     libpcsclite-dev
 
             - name: Build chip-tool
-              run: scripts/run_in_build_env.sh "./scripts/build/build_examples.py --target linux-arm64-chip-tool build"
+              run: scripts/run_in_build_env.sh "./scripts/build/build_examples.py --target linux-arm64-chip-tool-platform-mdns build"
 
             - name: Build and run address resolution test
               run: |
@@ -47,7 +47,7 @@ jobs:
             - name: Package chip-tool
               run: |
                   mkdir -p artifact
-                  cp out/linux-arm64-chip-tool/chip-tool artifact/chip-tool
+                  cp out/linux-arm64-chip-tool-platform-mdns/chip-tool artifact/chip-tool
                   strip artifact/chip-tool
                   sha256sum artifact/chip-tool > artifact/SHA256SUMS
 
