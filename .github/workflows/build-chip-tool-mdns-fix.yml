@@ -24,6 +24,17 @@ jobs:
                   platform: linux
                   bootstrap-log-name: bootstrap-logs-arm64-chip-tool-mdns-fix
 
+            - name: Install Linux chip-tool dependencies
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y \
+                    gdbus-codegen \
+                    libavahi-client-dev \
+                    libdbus-1-dev \
+                    libevent-dev \
+                    libglib2.0-dev \
+                    libpcsclite-dev
+
             - name: Build chip-tool
               run: scripts/run_in_build_env.sh "./scripts/build/build_examples.py --target linux-arm64-chip-tool build"
 
