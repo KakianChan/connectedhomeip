@@ -40,8 +40,9 @@ jobs:
 
             - name: Build and run address resolution test
               run: |
-                  scripts/run_in_build_env.sh "ninja -C out/linux-arm64-chip-tool src/lib/address_resolve/tests:TestAddressResolve_DefaultImpl"
-                  scripts/run_in_build_env.sh "out/linux-arm64-chip-tool/tests/TestAddressResolve_DefaultImpl"
+                  scripts/run_in_build_env.sh "gn gen out/linux-arm64-tests --args='chip_build_tests=true target_cpu=\"arm64\"'"
+                  scripts/run_in_build_env.sh "ninja -C out/linux-arm64-tests src/lib/address_resolve/tests:TestAddressResolve_DefaultImpl"
+                  scripts/run_in_build_env.sh "out/linux-arm64-tests/tests/TestAddressResolve_DefaultImpl"
 
             - name: Package chip-tool
               run: |
